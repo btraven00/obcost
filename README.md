@@ -9,6 +9,17 @@ append-only JSONL; query them with DuckDB. Plans need `api_version` 0.8 or later
 go build -o obcost .
 obcost ingest [-exit N] [-a key=value]... OUT_DIR   # an ob out dir
 ob config hooks.post-run "obcost post-run"           # or after every ob run (design 016)
+obcost ls [PLAN]                                     # runs, newest first
+```
+
+`ls PLAN` keeps one benchmark's runs: PLAN is a plan file (matched by its
+`provenance.canonical_url`, else its `id`), a URL, or a plan id. Matching by URL
+groups forks and variants of a benchmark; it also means a changed
+`canonical_url` starts a new group (`ls OLD_URL` still finds the old runs).
+
+```
+RUN       TIME              PLAN                     EXIT  NODES  SECONDS  MAX_RSS_MB  ATTRS
+dd90aa37  2026-11-07T15:51  omni_thoa_example@0.1.0  0     2      57.2     2038        remote=local
 ```
 
 Rows go to `$OBCOST_DIR` (default `$XDG_DATA_HOME/obcost`): `runs.jsonl`, `nodes.jsonl`.

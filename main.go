@@ -4,6 +4,7 @@
 //
 //	obcost ingest [-exit N] [-a key=value]... OUT_DIR
 //	obcost post-run PLAN OUT_DIR EXIT        as ob's post-run hook (design 016)
+//	obcost ls [PLAN]                         runs, newest first; PLAN narrows to one benchmark
 //
 // Rows go to $OBCOST_DIR (default $XDG_DATA_HOME/obcost): runs.jsonl and
 // nodes.jsonl. A run already ingested (same run_id) is skipped.
@@ -21,6 +22,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"text/tabwriter"
 	"time"
 )
 
@@ -151,12 +153,16 @@ func atLeast(v string, major, minor int) bool {
 // for the first three when ob runs us.
 // ponytail: a line scan of top-level keys, not a YAML parser; enough for ob's plans.
 func planIdentity(out string) (id, ver, url, api string) {
-	defer func() {
-		if e := os.Getenv("OB_PLAN_ID"); e != "" {
-			id, ver, url = e, os.Getenv("OB_PLAN_VERSION"), os.Getenv("OB_PLAN_URL")
-		}
-	}()
-	f, err := os.Open(filepath.Join(out, ".metadata", "benchmark.yaml"))
+	id, ver, url, api = scanPlan(filepath.Join(out, ".metadata", "benchmark.yaml"))
+	if e := os.Getenv("OB_PLAN_ID"); e != "" {
+		id, ver, url = e, os.Getenv("OB_PLAN_VERSION"), os.Getenv("OB_PLAN_URL")
+	}
+	return
+}
+
+// scanPlan reads a plan file's id, version, canonical_url and api_version.
+func scanPlan(path string) (id, ver, url, api string) {
+	f, err := os.Open(path)
 	if err != nil {
 		return
 	}
@@ -178,6 +184,76 @@ func planIdentity(out string) (id, ver, url, api string) {
 		}
 	}
 	return
+}
+
+// readJSONL decodes one T per line of path; a missing file is empty.
+func readJSONL[T any](path string) ([]T, error) {
+	f, err := os.Open(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var rows []T
+	for dec := json.NewDecoder(f); dec.More(); {
+		var r T
+		if err := dec.Decode(&r); err != nil {
+			return rows, err
+		}
+		rows = append(rows, r)
+	}
+	return rows, nil
+}
+
+// list prints the recorded runs, newest first; sel narrows them to one plan:
+// a plan file (its canonical_url, else its id), a URL, or a plan id.
+func list(sel string) error {
+	match := func(Run) bool { return true }
+	if sel != "" {
+		key, byURL := sel, strings.Contains(sel, "://")
+		if _, err := os.Stat(sel); err == nil {
+			id, _, url, _ := scanPlan(sel)
+			key, byURL = url, url != ""
+			if !byURL {
+				key = id
+			}
+		}
+		match = func(r Run) bool { return byURL && r.PlanURL == key || !byURL && r.PlanID == key }
+	}
+	runs, err := readJSONL[Run](filepath.Join(store(), "runs.jsonl"))
+	if err != nil {
+		return err
+	}
+	nodes, err := readJSONL[Node](filepath.Join(store(), "nodes.jsonl"))
+	if err != nil {
+		return err
+	}
+	secs, rss := map[string]float64{}, map[string]float64{}
+	for _, n := range nodes {
+		secs[n.RunID] += n.Perf["s"]
+		rss[n.RunID] = max(rss[n.RunID], n.Perf["max_rss"])
+	}
+	slices.SortFunc(runs, func(a, b Run) int { return strings.Compare(b.Timestamp, a.Timestamp) })
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "RUN\tTIME\tPLAN\tEXIT\tNODES\tSECONDS\tMAX_RSS_MB\tATTRS")
+	for _, r := range runs {
+		if !match(r) {
+			continue
+		}
+		exit := "-"
+		if r.ExitCode != nil {
+			exit = strconv.Itoa(*r.ExitCode)
+		}
+		attrs := make([]string, 0, len(r.Attributes))
+		for k, v := range r.Attributes {
+			attrs = append(attrs, k+"="+v)
+		}
+		slices.Sort(attrs)
+		fmt.Fprintf(tw, "%.8s\t%.16s\t%s@%s\t%s\t%d\t%.1f\t%.0f\t%s\n", r.RunID, r.Timestamp,
+			r.PlanID, r.PlanVer, exit, r.Nodes, secs[r.RunID], rss[r.RunID], strings.Join(attrs, " "))
+	}
+	return tw.Flush()
 }
 
 func store() string {
@@ -260,6 +336,8 @@ const usage = `usage:
   obcost ingest [-exit N] [-a key=value]... OUT_DIR   record an ob run
   obcost post-run PLAN OUT_DIR EXIT                   the same, as ob's post-run hook:
                                                       ob config hooks.post-run "obcost post-run"
+  obcost ls [PLAN]                                    list runs, newest first; PLAN (a plan file,
+                                                      URL or plan id) keeps that benchmark's runs
 rows: $OBCOST_DIR (default $XDG_DATA_HOME/obcost)/{runs,nodes}.jsonl
 `
 
@@ -285,6 +363,12 @@ func main() {
 			e = exit
 		}
 		err = record(fl.Arg(0), e, attrs)
+	case "ls":
+		if len(os.Args) > 3 {
+			err = errors.New("ls: at most one PLAN")
+			break
+		}
+		err = list(strings.Join(os.Args[2:], ""))
 	case "post-run":
 		if len(os.Args) != 5 {
 			err = errors.New("post-run: need PLAN OUT_DIR EXIT")

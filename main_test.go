@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -85,6 +86,42 @@ func TestRefusesOldAPI(t *testing.T) {
 	for v, want := range map[string]bool{"0.8.0": true, "0.10.0": true, "1.0": true, "0.7.9": false, "": false, "x.y": false} {
 		if atLeast(v, 0, 8) != want {
 			t.Errorf("atLeast(%q) != %v", v, want)
+		}
+	}
+}
+
+func TestList(t *testing.T) {
+	t.Setenv("OBCOST_DIR", t.TempDir())
+	t.Setenv("OB_PLAN_ID", "")
+	for _, p := range []struct{ run, id, url string }{{"aaaa1111", "a", "https://x/a.yaml"}, {"bbbb2222", "b", ""}} {
+		out := t.TempDir()
+		write(t, filepath.Join(out, ".metadata/manifest.json"), `{"run_id":"`+p.run+`"}`)
+		write(t, filepath.Join(out, ".metadata/benchmark.yaml"), "id: "+p.id+"\napi_version: 0.8.0\nprovenance:\n  canonical_url: "+p.url+"\n")
+		write(t, filepath.Join(out, "S.m.x/performance.txt"), perf)
+		if err := record(out, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	plan := filepath.Join(t.TempDir(), "plan.yaml") // a fork of a: other id, same canonical_url
+	write(t, plan, "id: a-fork\nprovenance:\n  canonical_url: https://x/a.yaml\n")
+	for sel, want := range map[string]string{"": "aaaa1111 bbbb2222", plan: "aaaa1111", "https://x/a.yaml": "aaaa1111", "b": "bbbb2222"} {
+		r, w, _ := os.Pipe()
+		stdout := os.Stdout
+		os.Stdout = w
+		err := list(sel)
+		w.Close()
+		os.Stdout = stdout
+		b := make([]byte, 4096)
+		n, _ := r.Read(b)
+		var got []string
+		for _, l := range strings.Split(string(b[:n]), "\n")[1:] {
+			if f := strings.Fields(l); len(f) > 0 {
+				got = append(got, f[0])
+			}
+		}
+		slices.Sort(got)
+		if err != nil || strings.Join(got, " ") != want {
+			t.Errorf("ls %q = %v, %v; want %s", sel, got, err, want)
 		}
 	}
 }
