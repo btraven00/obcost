@@ -262,14 +262,15 @@ func list(sel string) error {
 	if err != nil {
 		return err
 	}
-	secs, rss := map[string]float64{}, map[string]float64{}
+	secs, rss, bytes := map[string]float64{}, map[string]float64{}, map[string]int64{}
 	for _, n := range nodes {
 		secs[n.RunID] += n.Perf["s"]
 		rss[n.RunID] = max(rss[n.RunID], n.Perf["max_rss"])
+		bytes[n.RunID] += n.Bytes
 	}
 	slices.SortFunc(runs, func(a, b Run) int { return strings.Compare(b.Timestamp, a.Timestamp) })
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "RUN\tTIME\tPLAN\tSLICE\tEXIT\tNODES\tSECONDS\tMAX_RSS_MB\tATTRS")
+	fmt.Fprintln(tw, "RUN\tTIME\tPLAN\tSLICE\tEXIT\tNODES\tSECONDS\tMAX_RSS_MB\tOUTPUT_MB\tATTRS")
 	for _, r := range runs {
 		if !match(r) {
 			continue
@@ -283,8 +284,9 @@ func list(sel string) error {
 			attrs = append(attrs, k+"="+v)
 		}
 		slices.Sort(attrs)
-		fmt.Fprintf(tw, "%.8s\t%.16s\t%s@%s\t%s\t%s\t%d\t%.1f\t%.0f\t%s\n", r.RunID, r.Timestamp,
-			r.PlanID, r.PlanVer, slice(r.Selection), exit, r.Nodes, secs[r.RunID], rss[r.RunID], strings.Join(attrs, " "))
+		fmt.Fprintf(tw, "%.8s\t%.16s\t%s@%s\t%s\t%s\t%d\t%.1f\t%.0f\t%.1f\t%s\n", r.RunID, r.Timestamp,
+			r.PlanID, r.PlanVer, slice(r.Selection), exit, r.Nodes, secs[r.RunID], rss[r.RunID],
+			float64(bytes[r.RunID])/1e6, strings.Join(attrs, " "))
 	}
 	return tw.Flush()
 }
