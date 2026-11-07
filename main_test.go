@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"slices"
@@ -123,5 +124,37 @@ func TestList(t *testing.T) {
 		if err != nil || strings.Join(got, " ") != want {
 			t.Errorf("ls %q = %v, %v; want %s", sel, got, err, want)
 		}
+	}
+}
+
+func TestImportRemoteStore(t *testing.T) {
+	out := t.TempDir()
+	write(t, filepath.Join(out, ".metadata/manifest.json"), `{"run_id":"remote01"}`)
+	write(t, filepath.Join(out, ".metadata/benchmark.yaml"), "id: p\napi_version: 0.8.0\n")
+	write(t, filepath.Join(out, "DATA.m.x/performance.txt"), perf)
+	// on the VM: obcost as ob's post-run hook, into the out dir's .hooks/
+	remote := filepath.Join(out, ".hooks")
+	t.Setenv("OBCOST_DIR", remote)
+	t.Setenv("OB_HOOK", "post-run")
+	t.Setenv("OB_SELECTION", `{"until": "DATA"}`)
+	code := 0
+	if err := record(out, &code, nil); err != nil {
+		t.Fatal(err)
+	}
+	// locally: import it, attaching what the driver knows
+	t.Setenv("OB_HOOK", "")
+	t.Setenv("OBCOST_DIR", t.TempDir())
+	for range 2 {
+		if err := importStore(remote, map[string]string{"remote": "thoa", "cost_usd": "0.02"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runs, _ := readJSONL[Run](filepath.Join(store(), "runs.jsonl"))
+	nodes, _ := readJSONL[Node](filepath.Join(store(), "nodes.jsonl"))
+	if len(runs) != 1 || len(nodes) != 1 || runs[0].Attributes["remote"] != "thoa" || slice(runs[0].Selection) != "until=DATA" {
+		t.Fatalf("runs %+v nodes %d", runs, len(nodes))
+	}
+	if slice(nil) != "?" || slice(json.RawMessage("null")) != "full" {
+		t.Error("slice rendering")
 	}
 }

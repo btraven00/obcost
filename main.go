@@ -4,6 +4,7 @@
 //
 //	obcost ingest [-exit N] [-a key=value]... OUT_DIR
 //	obcost post-run PLAN OUT_DIR EXIT        as ob's post-run hook (design 016)
+//	obcost import [-a key=value]... DIR     merge another store (a remote run's out/.hooks/)
 //	obcost ls [PLAN]                         runs, newest first; PLAN narrows to one benchmark
 //
 // Rows go to $OBCOST_DIR (default $XDG_DATA_HOME/obcost): runs.jsonl and
@@ -12,11 +13,13 @@ package main
 
 import (
 	"bufio"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -27,20 +30,23 @@ import (
 )
 
 type Run struct {
-	RunID      string            `json:"run_id"`
-	Timestamp  string            `json:"timestamp"`
-	Ingested   string            `json:"ingested_at"`
-	OBVersion  string            `json:"ob_version"`
-	Host       string            `json:"hostname"`
-	CPUs       int               `json:"cpu_count"`
-	MemMB      int               `json:"memory_total_mb"`
-	PlanURL    string            `json:"plan_url"`
-	PlanID     string            `json:"plan_id"`
-	PlanVer    string            `json:"plan_version"`
-	API        string            `json:"api_version"`
-	OutDir     string            `json:"out_dir"`
-	ExitCode   *int              `json:"exit_code"`
-	Nodes      int               `json:"nodes"`
+	RunID     string `json:"run_id"`
+	Timestamp string `json:"timestamp"`
+	Ingested  string `json:"ingested_at"`
+	OBVersion string `json:"ob_version"`
+	Host      string `json:"hostname"`
+	CPUs      int    `json:"cpu_count"`
+	MemMB     int    `json:"memory_total_mb"`
+	PlanURL   string `json:"plan_url"`
+	PlanID    string `json:"plan_id"`
+	PlanVer   string `json:"plan_version"`
+	API       string `json:"api_version"`
+	OutDir    string `json:"out_dir"`
+	ExitCode  *int   `json:"exit_code"`
+	Nodes     int    `json:"nodes"`
+	// Selection is the slice of the plan the run covered, as ob's hooks pass
+	// it (OB_SELECTION): null for a full run, absent when unknown.
+	Selection  json.RawMessage   `json:"selection,omitempty"`
 	Attributes map[string]string `json:"attrs,omitempty"`
 }
 
@@ -78,6 +84,9 @@ func ingest(out string, exit *int, attrs map[string]string) (*Run, []Node, error
 		CPUs: man.CPUs, MemMB: man.MemMB, OutDir: abs, ExitCode: exit, Attributes: attrs,
 		Ingested: time.Now().UTC().Format(time.RFC3339)}
 	r.PlanID, r.PlanVer, r.PlanURL, r.API = planIdentity(out)
+	if os.Getenv("OB_HOOK") != "" { // run by ob: an empty OB_SELECTION is a full run
+		r.Selection = json.RawMessage(cmp.Or(os.Getenv("OB_SELECTION"), "null"))
+	}
 	// Before 0.8 ob laid outputs out as <stage>/<module>/.<params>/, which the
 	// node names below don't read; no api_version is the legacy 0.4 contract.
 	if !atLeast(r.API, 0, 8) {
@@ -236,7 +245,7 @@ func list(sel string) error {
 	}
 	slices.SortFunc(runs, func(a, b Run) int { return strings.Compare(b.Timestamp, a.Timestamp) })
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "RUN\tTIME\tPLAN\tEXIT\tNODES\tSECONDS\tMAX_RSS_MB\tATTRS")
+	fmt.Fprintln(tw, "RUN\tTIME\tPLAN\tSLICE\tEXIT\tNODES\tSECONDS\tMAX_RSS_MB\tATTRS")
 	for _, r := range runs {
 		if !match(r) {
 			continue
@@ -250,10 +259,25 @@ func list(sel string) error {
 			attrs = append(attrs, k+"="+v)
 		}
 		slices.Sort(attrs)
-		fmt.Fprintf(tw, "%.8s\t%.16s\t%s@%s\t%s\t%d\t%.1f\t%.0f\t%s\n", r.RunID, r.Timestamp,
-			r.PlanID, r.PlanVer, exit, r.Nodes, secs[r.RunID], rss[r.RunID], strings.Join(attrs, " "))
+		fmt.Fprintf(tw, "%.8s\t%.16s\t%s@%s\t%s\t%s\t%d\t%.1f\t%.0f\t%s\n", r.RunID, r.Timestamp,
+			r.PlanID, r.PlanVer, slice(r.Selection), exit, r.Nodes, secs[r.RunID], rss[r.RunID], strings.Join(attrs, " "))
 	}
 	return tw.Flush()
+}
+
+// slice renders a selection: full, until=DATA, module=M, filter=<8 hex>; ? if unknown.
+func slice(sel json.RawMessage) string {
+	if len(sel) == 0 {
+		return "?"
+	}
+	var m map[string]string
+	if json.Unmarshal(sel, &m) != nil || len(m) == 0 {
+		return "full"
+	}
+	for k, v := range m {
+		return fmt.Sprintf("%s=%.8s", k, v)
+	}
+	return "?"
 }
 
 func store() string {
@@ -298,6 +322,43 @@ func record(out string, exit *int, attrs map[string]string) error {
 	if r.RunID == "" {
 		return errors.New(out + ": manifest has no run_id")
 	}
+	return save(r, nodes)
+}
+
+// importStore merges another obcost store (e.g. a remote run's out/.hooks/)
+// into this one, adding attrs to its runs; runs already here are skipped.
+func importStore(src string, attrs map[string]string) error {
+	runs, err := readJSONL[Run](filepath.Join(src, "runs.jsonl"))
+	if err != nil {
+		return err
+	}
+	if len(runs) == 0 {
+		return errors.New(src + ": no runs.jsonl rows")
+	}
+	nodes, err := readJSONL[Node](filepath.Join(src, "nodes.jsonl"))
+	if err != nil {
+		return err
+	}
+	for _, r := range runs {
+		if r.Attributes == nil {
+			r.Attributes = map[string]string{}
+		}
+		maps.Copy(r.Attributes, attrs)
+		var own []Node
+		for _, n := range nodes {
+			if n.RunID == r.RunID {
+				own = append(own, n)
+			}
+		}
+		if err := save(&r, own); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// save appends a run and its nodes unless the run is already recorded.
+func save(r *Run, nodes []Node) error {
 	dir := store()
 	if seen(dir, r.RunID) {
 		fmt.Fprintf(os.Stderr, "obcost: run %s already recorded\n", r.RunID)
@@ -336,6 +397,8 @@ const usage = `usage:
   obcost ingest [-exit N] [-a key=value]... OUT_DIR   record an ob run
   obcost post-run PLAN OUT_DIR EXIT                   the same, as ob's post-run hook:
                                                       ob config hooks.post-run "obcost post-run"
+  obcost import [-a key=value]... DIR                  merge another obcost store (e.g. a remote
+                                                      run's out/.hooks/) into this one
   obcost ls [PLAN]                                    list runs, newest first; PLAN (a plan file,
                                                       URL or plan id) keeps that benchmark's runs
 rows: $OBCOST_DIR (default $XDG_DATA_HOME/obcost)/{runs,nodes}.jsonl
@@ -363,6 +426,16 @@ func main() {
 			e = exit
 		}
 		err = record(fl.Arg(0), e, attrs)
+	case "import":
+		fl := flag.NewFlagSet("import", flag.ExitOnError)
+		attrs := attrFlag{}
+		fl.Var(attrs, "a", "attribute key=value for the imported runs (repeatable)")
+		fl.Parse(os.Args[2:])
+		if fl.NArg() != 1 {
+			err = errors.New("import: need DIR")
+			break
+		}
+		err = importStore(fl.Arg(0), attrs)
 	case "ls":
 		if len(os.Args) > 3 {
 			err = errors.New("ls: at most one PLAN")
