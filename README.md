@@ -24,8 +24,17 @@ groups forks and variants of a benchmark; it also means a changed
 `canonical_url` starts a new group (`ls OLD_URL` still finds the old runs).
 
 ```
-RUN       TIME              PLAN                     SLICE       EXIT  NODES  SECONDS  MAX_RSS_MB  ATTRS
-5d0e7a11  2026-11-07T17:02  omni_thoa_example@0.1.0  until=DATA  0     1      31.2     138         remote=thoa
+RUN       TIME              PLAN                     SLICE         EXIT  NODES  SECONDS  MAX_RSS_MB  ATTRS
+d8782049  2026-11-07T16:31  omni_thoa_example@0.1.0  until=REPORT  0     0      0.0      0           billed_cost_usd=0.027611855744 credits_debited=3 job=eede5824-… remote=thoa
+51396bac  2026-11-07T16:22  omni_thoa_example@0.1.0  until=FILT    0     1      16.1     3135        billed_cost_usd=0.043865181998 credits_debited=5 job=5627cbb4-… remote=thoa
+3a47fadc  2026-11-07T16:16  omni_thoa_example@0.1.0  until=DATA    0     1      26.3     138         billed_cost_usd=0.032107879039 credits_debited=4 job=d740d765-… remote=thoa
+```
+
+Three slices of a plan run as thoa jobs (omni-thoa-example's `thoa/slices.py`): obcost ran
+as ob's post-run hook on each VM, and the driver imported the rows with thoa's cost.
+REPORT has no nodes because ob's gather rules write no `performance.txt`.
+
+```
 ```
 
 Rows go to `$OBCOST_DIR` (default `$XDG_DATA_HOME/obcost`): `runs.jsonl`, `nodes.jsonl`.
