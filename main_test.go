@@ -158,3 +158,20 @@ func TestImportRemoteStore(t *testing.T) {
 		t.Error("slice rendering")
 	}
 }
+
+func TestRunRecord407(t *testing.T) {
+	out := t.TempDir()
+	t.Setenv("OBCOST_DIR", t.TempDir())
+	write(t, filepath.Join(out, ".metadata/manifest.json"), `{"run_id":"r407"}`)
+	write(t, filepath.Join(out, ".metadata/benchmark.yaml"), "id: p\napi_version: 0.8.0\n")
+	write(t, filepath.Join(out, ".metadata/runs.jsonl"),
+		`{"run_id":"old","selection":null,"benchmark":{"id":"p"}}`+"\n"+
+			`{"run_id":"r407","selection":{"filter":{"sha256":"abcdef0123","parent":null}},"benchmark":{"id":"p","version":"2","summary_hash":"f00d","api_version":"0.8.0"}}`+"\n")
+	r, _, err := ingest(out, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slice(r.Selection) != "filter=abcdef01" || r.PlanHash != "f00d" || r.PlanVer != "2" {
+		t.Errorf("run %+v, slice %s", r, slice(r.Selection))
+	}
+}

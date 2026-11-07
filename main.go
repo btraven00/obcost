@@ -41,11 +41,13 @@ type Run struct {
 	PlanID    string `json:"plan_id"`
 	PlanVer   string `json:"plan_version"`
 	API       string `json:"api_version"`
+	PlanHash  string `json:"summary_hash,omitempty"` // ob's hash of the full plan (#407)
 	OutDir    string `json:"out_dir"`
 	ExitCode  *int   `json:"exit_code"`
 	Nodes     int    `json:"nodes"`
-	// Selection is the slice of the plan the run covered, as ob's hooks pass
-	// it (OB_SELECTION): null for a full run, absent when unknown.
+	// Selection is the slice of the plan the run covered: from ob's run
+	// record (#407) or hooks (OB_SELECTION); null for a full run, absent when
+	// unknown.
 	Selection  json.RawMessage   `json:"selection,omitempty"`
 	Attributes map[string]string `json:"attrs,omitempty"`
 }
@@ -86,6 +88,28 @@ func ingest(out string, exit *int, attrs map[string]string) (*Run, []Node, error
 	r.PlanID, r.PlanVer, r.PlanURL, r.API = planIdentity(out)
 	if os.Getenv("OB_HOOK") != "" { // run by ob: an empty OB_SELECTION is a full run
 		r.Selection = json.RawMessage(cmp.Or(os.Getenv("OB_SELECTION"), "null"))
+	}
+	// ob's run record (007 §4.6, #407), when there is one, is the authority.
+	recs, _ := readJSONL[struct {
+		RunID     string          `json:"run_id"`
+		Selection json.RawMessage `json:"selection"`
+		Benchmark struct {
+			ID      string `json:"id"`
+			Version string `json:"version"`
+			API     string `json:"api_version"`
+			Hash    string `json:"summary_hash"`
+		} `json:"benchmark"`
+	}](filepath.Join(out, ".metadata", "runs.jsonl"))
+	for _, rec := range recs {
+		if rec.RunID == r.RunID {
+			b := rec.Benchmark
+			r.Selection = rec.Selection
+			if len(r.Selection) == 0 {
+				r.Selection = json.RawMessage("null")
+			}
+			r.PlanID, r.PlanVer = cmp.Or(b.ID, r.PlanID), cmp.Or(b.Version, r.PlanVer)
+			r.API, r.PlanHash = cmp.Or(b.API, r.API), b.Hash
+		}
 	}
 	// Before 0.8 ob laid outputs out as <stage>/<module>/.<params>/, which the
 	// node names below don't read; no api_version is the legacy 0.4 contract.
@@ -265,17 +289,22 @@ func list(sel string) error {
 	return tw.Flush()
 }
 
-// slice renders a selection: full, until=DATA, module=M, filter=<8 hex>; ? if unknown.
+// slice renders a selection: full, until=DATA, module=M, filter=<sha8>; ? if unknown.
 func slice(sel json.RawMessage) string {
 	if len(sel) == 0 {
 		return "?"
 	}
-	var m map[string]string
+	var m map[string]json.RawMessage
 	if json.Unmarshal(sel, &m) != nil || len(m) == 0 {
 		return "full"
 	}
 	for k, v := range m {
-		return fmt.Sprintf("%s=%.8s", k, v)
+		var str string
+		var f struct{ Sha256 string }
+		if json.Unmarshal(v, &str) != nil && json.Unmarshal(v, &f) == nil {
+			str = f.Sha256 // #407's {"filter": {"sha256", "parent"}}
+		}
+		return fmt.Sprintf("%s=%.8s", k, str)
 	}
 	return "?"
 }
